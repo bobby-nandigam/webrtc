@@ -39,7 +39,18 @@ wss.on('connection', (ws) => {
       // Handle ping/pong
       if (data.type === 'ping') {
         ws.send(JSON.stringify({ type: 'pong' }));
-        console.log(`💓 Ping from ${ws.id} → Pong sent`);
+        print(`💓 Ping from ${ws.id} → Pong sent`);
+        return;
+      }
+      
+      // Handle ICE restart requests
+      if (data.type === 'ice_restart') {
+        if (clients[data.to]) {
+          console.log(`🔄 Forwarding ICE_RESTART: ${data.from} → ${data.to}`);
+          clients[data.to].send(JSON.stringify(data));
+        } else {
+          console.log(`❌ ICE_RESTART target not found: ${data.to}`);
+        }
         return;
       }
 

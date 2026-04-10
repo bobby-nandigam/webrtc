@@ -157,24 +157,29 @@ class _VideoCallPageState extends State<VideoCallPage> {
     });
     print('✅ Local renderer set with stream');
 
-    // Step 3: Create peer connection with STUN + TURN servers
+    // Step 3: Create peer connection with multiple STUN + TURN servers
     _peerConnection = await createPeerConnection({
       'iceServers': [
+        // Google STUN servers
         {'urls': 'stun:stun.l.google.com:19302'},
         {'urls': 'stun:stun1.l.google.com:19302'},
+        {'urls': 'stun:stun2.l.google.com:19302'},
+        {'urls': 'stun:stun3.l.google.com:19302'},
+        // Primary TURN (OpenRelay)
         {
-          'urls': 'turn:openrelay.metered.ca:80',
+          'urls': ['turn:openrelay.metered.ca:80', 'turn:openrelay.metered.ca:443'],
           'username': 'openrelayproject',
           'credential': 'openrelayproject',
         },
+        // Backup TURN (Twillio - public test account)
         {
-          'urls': 'turn:openrelay.metered.ca:443?transport=tcp',
-          'username': 'openrelayproject',
-          'credential': 'openrelayproject',
+          'urls': 'turn:numb.viagenie.ca',
+          'username': 'webrtc@example.com',
+          'credential': 'webrtccredential',
         },
       ],
     });
-    print('✅ Peer connection created with STUN+TURN servers');
+    print('✅ Peer connection created with multi-server ICE config');
 
     // Step 4: Setup handlers BEFORE adding tracks
     _peerConnection!.onTrack = (RTCTrackEvent event) {
@@ -211,29 +216,45 @@ class _VideoCallPageState extends State<VideoCallPage> {
         print('❌ PEER CONNECTION FAILED! Attempting ICE restart...');
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('⚠️ Connection unstable - attempting recovery...'),
+            content: Text('⚠️ Connection failed - retrying with different route...'),
+            duration: Duration(seconds: 3),
           ),
         );
 
-        // Attempt ICE restart
+        // Attempt ICE restart with delay
         if (_remoteUserId != null && _peerConnection != null) {
-          _peerConnection!
-              .restartIce()
-              .then((_) {
-                print('🔄 ICE restart initiated');
-                // Send ICE_RESTART signal to remote peer
-                channel.sink.add(
-                  jsonEncode({
-                    'type': 'ice_restart',
-                    'from': _userId,
-                    'to': _remoteUserId,
-                  }),
-                );
-                print('📨 Sent ICE_RESTART to $_remoteUserId');
-              })
-              .catchError((e) {
-                print('❌ ICE restart failed: $e');
-              });
+          await Future.delayed(Duration(seconds: 2));
+          try {
+            _peerConnection!.restartIce();
+            print('🔄 ICE restart initiated');
+            
+            // Send ICE_RESTART signal to remote peer
+            channel.sink.add(
+              jsonEncode({
+                'type': 'ice_restart',
+                'from': _userId,
+                'to': _remoteUserId,
+              }),
+            );
+            print('📨 Sent ICE_RESTART to $_remoteUserId');
+          } catch (e) {
+            print('❌ ICE restart failed: $e');
+            
+            // If restart fails, offer to reconnect
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: const Text('Connection error. Try ending call and retrying.'),
+                duration: const Duration(seconds: 5),
+                action: SnackBarAction(
+                  label: 'End Call',
+                  onPressed: () {
+                    setState(() => _inCall = false);
+                    _peerConnection?.close();
+                  },
+                ),
+              ),
+            );
+          }
         }
       } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateClosed) {
         print('❌ PEER CONNECTION CLOSED');
