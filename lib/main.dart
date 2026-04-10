@@ -260,38 +260,39 @@ class _VideoCallPageState extends State<VideoCallPage> {
 
         // Attempt ICE restart with delay
         if (_remoteUserId != null && _peerConnection != null) {
-          await Future.delayed(Duration(seconds: 2));
-          try {
-            _peerConnection!.restartIce();
-            print('🔄 ICE restart initiated');
-            
-            // Send ICE_RESTART signal to remote peer
-            channel.sink.add(
-              jsonEncode({
-                'type': 'ice_restart',
-                'from': _userId,
-                'to': _remoteUserId,
-              }),
-            );
-            print('📨 Sent ICE_RESTART to $_remoteUserId');
-          } catch (e) {
-            print('❌ ICE restart failed: $e');
-            
-            // If restart fails, offer to reconnect
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: const Text('Connection error. Try ending call and retrying.'),
-                duration: const Duration(seconds: 5),
-                action: SnackBarAction(
-                  label: 'End Call',
-                  onPressed: () {
-                    setState(() => _inCall = false);
-                    _peerConnection?.close();
-                  },
+          Future.delayed(Duration(seconds: 2), () {
+            try {
+              _peerConnection!.restartIce();
+              print('🔄 ICE restart initiated');
+              
+              // Send ICE_RESTART signal to remote peer
+              channel.sink.add(
+                jsonEncode({
+                  'type': 'ice_restart',
+                  'from': _userId,
+                  'to': _remoteUserId,
+                }),
+              );
+              print('📨 Sent ICE_RESTART to $_remoteUserId');
+            } catch (e) {
+              print('❌ ICE restart failed: $e');
+              
+              // If restart fails, offer to reconnect
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: const Text('Connection error. Try ending call and retrying.'),
+                  duration: const Duration(seconds: 5),
+                  action: SnackBarAction(
+                    label: 'End Call',
+                    onPressed: () {
+                      setState(() => _inCall = false);
+                      _peerConnection?.close();
+                    },
+                  ),
                 ),
-              ),
-            );
-          }
+              );
+            }
+          });
         }
       } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateClosed) {
         print('❌ PEER CONNECTION CLOSED');
