@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -33,32 +34,40 @@ class _VideoCallPageState extends State<VideoCallPage> {
   final _remoteRenderer = RTCVideoRenderer();
 
   late WebSocketChannel channel;
-  
+
   // User IDs
   late String _userId;
   String? _remoteUserId;
-  
+
   // Call state flags
   bool _inCall = false;
   bool _incomingCall = false;
   String? _incomingOffer;
+
+  // Connection status
+  String _connectionStatus = "Connecting...";
+  String _iceConnectionStatus = "Gathering...";
+  
+  // Keep-alive timer
+  Timer? _keepAliveTimer;
 
   late TextEditingController _remoteUserIdController;
 
   @override
   void initState() {
     super.initState();
-    // Generate unique user ID
     _userId = 'user_${Random().nextInt(100000)}';
     _remoteUserIdController = TextEditingController();
-    requestPermissions();
-    initRenderers();
-    connectSocket();
-    start();
+    _initializeApp();
   }
 
-  Future<void> requestPermissions() async {
-    await [Permission.camera, Permission.microphone].request();
+  void _initializeApp() {
+    requestPermissions().then((_) {
+      initRenderers().then((_) {
+        connectSocket();
+        start();
+      });
+    });
   }
 
   Future<void> initRenderers() async {
@@ -72,10 +81,18 @@ class _VideoCallPageState extends State<VideoCallPage> {
     );
 
     // Send join message
-    channel.sink.add(jsonEncode({
-      'type': 'join',
-      'id': _userId,
-    }));
+    channel.sink.add(jsonEncode({'type': 'join', 'id': _userId}));
+    
+    // Start keep-alive ping (every 20 seconds to prevent timeout)
+    _keepAliveTimer?.cancel();
+    _keepAliveTimer = Timer.periodic(Duration(seconds: 20), (_) {
+      try {
+        channel.sink.add(jsonEncode({'type': 'ping'}));
+        print('💓 Keep-alive ping sent');
+      } catch (e) {
+        print('⚠️ Failed to send ping: $e');
+      }
+    });
 
     channel.stream.listen((message) async {
       var data = jsonDecode(message);
@@ -108,33 +125,154 @@ class _VideoCallPageState extends State<VideoCallPage> {
           ),
         );
       }
+
+      if (data['type'] == 'ice_restart') {
+        print('📨 Received ICE_RESTART from ${data['from']}');
+        if (_peerConnection != null) {
+          try {
+            await _peerConnection!.restartIce();
+            print('🔄 ICE restart acknowledged and processed');
+          } catch (e) {
+            print('❌ Error restarting ICE: $e');
+          }
+        }
+      }
     });
   }
 
   Future<void> start() async {
+    // Step 1: Get local stream
     _localStream = await navigator.mediaDevices.getUserMedia({
       'audio': true,
       'video': true,
     });
 
-    _localRenderer.srcObject = _localStream;
+    print('✅ Local stream acquired: ${_localStream!.id}');
+    print('🎬 Video tracks: ${_localStream!.getVideoTracks().length}');
+    print('🎤 Audio tracks: ${_localStream!.getAudioTracks().length}');
 
+    // Step 2: Set local renderer immediately
+    setState(() {
+      _localRenderer.srcObject = _localStream;
+    });
+    print('✅ Local renderer set with stream');
+
+    // Step 3: Create peer connection with STUN + TURN servers
     _peerConnection = await createPeerConnection({
       'iceServers': [
         {'urls': 'stun:stun.l.google.com:19302'},
+        {'urls': 'stun:stun1.l.google.com:19302'},
+        {
+          'urls': 'turn:openrelay.metered.ca:80',
+          'username': 'openrelayproject',
+          'credential': 'openrelayproject',
+        },
+        {
+          'urls': 'turn:openrelay.metered.ca:443?transport=tcp',
+          'username': 'openrelayproject',
+          'credential': 'openrelayproject',
+        },
       ],
     });
+    print('✅ Peer connection created with STUN+TURN servers');
 
-    _localStream!.getTracks().forEach((track) {
-      _peerConnection!.addTrack(track, _localStream!);
-    });
+    // Step 4: Setup handlers BEFORE adding tracks
+    _peerConnection!.onTrack = (RTCTrackEvent event) {
+      print('🎥 onTrack fired! Track kind: ${event.track.kind}');
+      print('📊 Streams available: ${event.streams.length}');
 
-    _peerConnection!.onTrack = (event) {
-      _remoteRenderer.srcObject = event.streams[0];
+      if (event.streams.isNotEmpty) {
+        print('✅ Setting remote stream: ${event.streams[0].id}');
+        setState(() {
+          _remoteRenderer.srcObject = event.streams[0];
+        });
+        print('✅ Remote renderer updated');
+      } else {
+        print('❌ No streams in event');
+      }
     };
 
-    _peerConnection!.onIceCandidate = (candidate) {
+    // Connection state handlers
+    _peerConnection!.onConnectionState = (RTCPeerConnectionState state) {
+      print('🔗 Connection State: $state');
+      setState(() {
+        _connectionStatus = state.toString().split('.').last;
+      });
+
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        print('✅ PEER CONNECTION ESTABLISHED!');
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('✅ Connected! Video stream ready'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+        print('❌ PEER CONNECTION FAILED! Attempting ICE restart...');
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('⚠️ Connection unstable - attempting recovery...'),
+          ),
+        );
+
+        // Attempt ICE restart
+        if (_remoteUserId != null && _peerConnection != null) {
+          _peerConnection!
+              .restartIce()
+              .then((_) {
+                print('🔄 ICE restart initiated');
+                // Send ICE_RESTART signal to remote peer
+                channel.sink.add(
+                  jsonEncode({
+                    'type': 'ice_restart',
+                    'from': _userId,
+                    'to': _remoteUserId,
+                  }),
+                );
+                print('📨 Sent ICE_RESTART to $_remoteUserId');
+              })
+              .catchError((e) {
+                print('❌ ICE restart failed: $e');
+              });
+        }
+      } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateClosed) {
+        print('❌ PEER CONNECTION CLOSED');
+        setState(() {
+          _inCall = false;
+        });
+      }
+    };
+
+    _peerConnection!.onIceConnectionState = (RTCIceConnectionState state) {
+      String stateStr = state.toString().split('.').last;
+      print('🧊 ICE Connection State: $stateStr');
+      setState(() {
+        _iceConnectionStatus = stateStr;
+      });
+      
+      // Log state transitions for debugging
+      if (stateStr.contains('Connected')) {
+        print('✅ ICE Connected - media should flow');
+      } else if (stateStr.contains('Failed')) {
+        print('❌ ICE Failed - checking alternate candidates');
+      } else if (stateStr.contains('Disconnected')) {
+        print('⚠️ ICE Disconnected - may recover');
+      } else if (stateStr.contains('Closed')) {
+        print('❌ ICE Closed - connection ended');
+      }
+    };
+
+    _peerConnection!.onSignalingState = (RTCSignalingState state) {
+      print('📡 Signaling State: $state');
+    };
+
+    _peerConnection!.onIceGatheringState = (RTCIceGatheringState state) {
+      print('🌍 ICE Gathering State: $state');
+    };
+
+    _peerConnection!.onIceCandidate = (RTCIceCandidate? candidate) {
       if (candidate != null && _remoteUserId != null) {
+        print('🧊 ICE candidate: ${candidate.candidate}');
         channel.sink.add(
           jsonEncode({
             'type': 'candidate',
@@ -147,26 +285,49 @@ class _VideoCallPageState extends State<VideoCallPage> {
         );
       }
     };
+
+    // Step 5: Add local tracks to peer connection
+    print(
+      '📤 Adding ${_localStream!.getTracks().length} tracks to peer connection',
+    );
+    _localStream!.getTracks().forEach((track) {
+      print('➕ Adding track: ${track.kind} (${track.id})');
+      _peerConnection!.addTrack(track, _localStream!);
+    });
+    print('✅ All tracks added to peer connection');
   }
 
   Future<void> createOffer() async {
-    if (_remoteUserId == null) {
+    // Validate target user
+    if (_remoteUserId == null || _remoteUserId!.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please enter remote user ID first')),
+        const SnackBar(content: Text('Invalid target user ID')),
       );
+      print('Invalid target user');
+      return;
+    }
+    
+    // Prevent self-calls
+    if (_remoteUserId == _userId) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Cannot call yourself')),
+      );
+      print('Cannot call yourself');
       return;
     }
 
     var offer = await _peerConnection!.createOffer();
     await _peerConnection!.setLocalDescription(offer);
 
-    channel.sink.add(jsonEncode({
-      'type': 'offer',
-      'from': _userId,
-      'to': _remoteUserId,
-      'sdp': offer.sdp
-    }));
-    
+    channel.sink.add(
+      jsonEncode({
+        'type': 'offer',
+        'from': _userId,
+        'to': _remoteUserId,
+        'sdp': offer.sdp,
+      }),
+    );
+
     setState(() => _inCall = true);
   }
 
@@ -205,12 +366,14 @@ class _VideoCallPageState extends State<VideoCallPage> {
     var answer = await _peerConnection!.createAnswer();
     await _peerConnection!.setLocalDescription(answer);
 
-    channel.sink.add(jsonEncode({
-      'type': 'answer',
-      'from': _userId,
-      'to': _remoteUserId,
-      'sdp': answer.sdp,
-    }));
+    channel.sink.add(
+      jsonEncode({
+        'type': 'answer',
+        'from': _userId,
+        'to': _remoteUserId,
+        'sdp': answer.sdp,
+      }),
+    );
 
     setState(() {
       _inCall = true;
@@ -224,12 +387,40 @@ class _VideoCallPageState extends State<VideoCallPage> {
     });
   }
 
+  Future<void> requestPermissions() async {
+    try {
+      await Permission.camera.request();
+      await Permission.microphone.request();
+      print('✅ Permission requests completed');
+    } catch (e) {
+      print('❌ Permission error: $e');
+    }
+  }
+
   @override
   void dispose() {
+    // Cancel keep-alive timer
+    _keepAliveTimer?.cancel();
+    print('⏹️ Keep-alive timer cancelled');
+    
+    // Close peer connection properly
+    if (_peerConnection != null) {
+      _peerConnection!.close();
+      _peerConnection = null;
+      print('🔌 Peer connection closed');
+    }
+    
+    // Clean up renderers
     _localRenderer.dispose();
     _remoteRenderer.dispose();
-    _peerConnection?.dispose();
-    channel.sink.close();
+    
+    // Close WebSocket
+    try {
+      channel.sink.close();
+    } catch (e) {
+      print('⚠️ Error closing channel: $e');
+    }
+    
     _remoteUserIdController.dispose();
     super.dispose();
   }
@@ -240,34 +431,74 @@ class _VideoCallPageState extends State<VideoCallPage> {
       appBar: AppBar(title: const Text("Free Video Call")),
       body: Column(
         children: [
-          // User ID Info
+          // User ID Info - Compact
           Padding(
-            padding: const EdgeInsets.all(8.0),
+            padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
             child: Column(
               children: [
-                Text("Your ID: $_userId", style: const TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(height: 8),
-                if (!_inCall)
-                  TextField(
-                    controller: _remoteUserIdController,
-                    decoration: InputDecoration(
-                      hintText: 'Enter remote user ID',
-                      border: OutlineInputBorder(),
-                      suffix: IconButton(
-                        icon: const Icon(Icons.clear),
-                        onPressed: () => _remoteUserIdController.clear(),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        "Your ID: $_userId",
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                        ),
                       ),
                     ),
-                    onChanged: (value) {
-                      setState(() {
-                        _remoteUserId = value.isEmpty ? null : value;
-                      });
-                    },
+                  ],
+                ),
+                const SizedBox(height: 2),
+                // Connection Status
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        "Status: $_connectionStatus | ICE: $_iceConnectionStatus",
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: _connectionStatus.contains('connected')
+                              ? Colors.green
+                              : Colors.orange,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                if (!_inCall)
+                  SizedBox(
+                    height: 36,
+                    child: TextField(
+                      controller: _remoteUserIdController,
+                      style: const TextStyle(fontSize: 12),
+                      decoration: InputDecoration(
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 8,
+                        ),
+                        hintText: 'Enter remote user ID',
+                        hintStyle: const TextStyle(fontSize: 12),
+                        border: OutlineInputBorder(),
+                        suffix: IconButton(
+                          padding: EdgeInsets.zero,
+                          iconSize: 16,
+                          icon: const Icon(Icons.clear),
+                          onPressed: () => _remoteUserIdController.clear(),
+                        ),
+                      ),
+                      onChanged: (value) {
+                        setState(() {
+                          _remoteUserId = value.isEmpty ? null : value;
+                        });
+                      },
+                    ),
                   ),
               ],
             ),
           ),
-          // Video Views
+          // Video Views - Big
           Expanded(child: RTCVideoView(_localRenderer, mirror: true)),
           Expanded(child: RTCVideoView(_remoteRenderer)),
           // Call Buttons
@@ -287,7 +518,9 @@ class _VideoCallPageState extends State<VideoCallPage> {
                       setState(() => _inCall = false);
                       _peerConnection?.close();
                     },
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red,
+                    ),
                     child: const Text("End Call"),
                   ),
               ],
