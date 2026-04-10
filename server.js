@@ -61,6 +61,30 @@ wss.on('connection', (ws) => {
 
         console.log(`✅ User joined: ${data.id}`);
         printUsers();
+        
+        // Broadcast active users list to ALL clients
+        const activeUsers = Object.keys(clients).filter(id => id !== data.id);
+        const userListPayload = {
+          type: 'users_list',
+          users: activeUsers,
+          total: activeUsers.length
+        };
+        
+        // Send to the new user
+        ws.send(JSON.stringify(userListPayload));
+        console.log(`📤 Sent user list to ${data.id}: ${activeUsers.join(', ') || 'none'}`);
+        
+        // Notify all other clients about the new user
+        wss.clients.forEach((client) => {
+          if (client.id && client.id !== data.id) {
+            client.send(JSON.stringify({
+              type: 'user_joined',
+              userId: data.id,
+              activeUsers: Object.keys(clients).filter(id => id !== client.id)
+            }));
+          }
+        });
+        
         return;
       }
 
@@ -78,9 +102,21 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     if (ws.id) {
-      console.log(`❌ User disconnected: ${ws.id}`);
-      delete clients[ws.id];
+      const disconnectedUser = ws.id;
+      console.log(`❌ User disconnected: ${disconnectedUser}`);
+      delete clients[disconnectedUser];
       printUsers();
+      
+      // Notify all remaining clients about the departure
+      wss.clients.forEach((client) => {
+        if (client.id) {
+          client.send(JSON.stringify({
+            type: 'user_left',
+            userId: disconnectedUser,
+            activeUsers: Object.keys(clients).filter(id => id !== client.id)
+          }));
+        }
+      });
     } else {
       console.log("❌ Unknown client disconnected");
     }

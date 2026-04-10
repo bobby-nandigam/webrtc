@@ -50,6 +50,9 @@ class _VideoCallPageState extends State<VideoCallPage> {
   
   // Keep-alive timer
   Timer? _keepAliveTimer;
+  
+  // Active users list
+  List<String> _activeUsers = [];
 
   late TextEditingController _remoteUserIdController;
 
@@ -96,6 +99,40 @@ class _VideoCallPageState extends State<VideoCallPage> {
 
     channel.stream.listen((message) async {
       var data = jsonDecode(message);
+
+      // Handle active users list from server
+      if (data['type'] == 'users_list') {
+        setState(() {
+          _activeUsers = List<String>.from(data['users'] ?? []);
+        });
+        print('📋 Active users: ${_activeUsers.join(', ') == '' ? 'none' : _activeUsers.join(', ')}');
+        return;
+      }
+      
+      // Handle new user joined
+      if (data['type'] == 'user_joined') {
+        setState(() {
+          _activeUsers = List<String>.from(data['activeUsers'] ?? []);
+        });
+        print('✅ New user joined: ${data['userId']} | Active: ${_activeUsers.join(', ')}');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('✅ ${data['userId']} is now online')),
+        );
+        return;
+      }
+      
+      // Handle user left
+      if (data['type'] == 'user_left') {
+        setState(() {
+          _activeUsers = List<String>.from(data['activeUsers'] ?? []);
+        });
+        print('❌ User left: ${data['userId']} | Active: ${_activeUsers.join(', ')}');
+        if (_remoteUserId == data['userId']) {
+          _remoteUserIdController.clear();
+          _remoteUserId = null;
+        }
+        return;
+      }
 
       // Track remote user
       if (data['from'] != null && _remoteUserId == null) {
@@ -487,6 +524,58 @@ class _VideoCallPageState extends State<VideoCallPage> {
                     ),
                   ],
                 ),
+                const SizedBox(height: 4),
+                // Active Users List
+                if (!_inCall && _activeUsers.isNotEmpty)
+                  SizedBox(
+                    height: 32,
+                    child: ListView.builder(
+                      scrollDirection: Axis.horizontal,
+                      itemCount: _activeUsers.length,
+                      itemBuilder: (context, index) {
+                        final userId = _activeUsers[index];
+                        return Padding(
+                          padding: const EdgeInsets.only(right: 4),
+                          child: GestureDetector(
+                            onTap: () {
+                              _remoteUserIdController.text = userId;
+                              setState(() => _remoteUserId = userId);
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text('✅ Selected: $userId'),
+                                  duration: const Duration(seconds: 1),
+                                ),
+                              );
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: _remoteUserId == userId
+                                    ? Colors.blue
+                                    : Colors.grey[300],
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Center(
+                                child: Text(
+                                  userId,
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    color: _remoteUserId == userId
+                                        ? Colors.white
+                                        : Colors.black,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
                 const SizedBox(height: 4),
                 if (!_inCall)
                   SizedBox(
